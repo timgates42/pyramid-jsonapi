@@ -19,10 +19,15 @@ from pyramid.httpexceptions import (
     status_map,
 )
 import pyramid_jsonapi.jsonapi
+from pyramid_jsonapi.results import Results
 import sqlalchemy
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.relationships import RelationshipProperty
 from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.exc import (
+    DataError,
+    StatementError
+)
 
 ONETOMANY = sqlalchemy.orm.interfaces.ONETOMANY
 MANYTOMANY = sqlalchemy.orm.interfaces.MANYTOMANY
@@ -262,8 +267,239 @@ class CollectionViewBase:
                 return {}
         return view_wrapper
 
-    @jsonapi_view
+    @functools.lru_cache()
+    def get_jsonapi_accepts(self, request):
+        """Return a set of all 'application/vnd.api' parts of the accept
+        header.
+        """
+        accepts = re.split(
+            r',\s*',
+            request.headers.get('accept', '')
+        )
+        return {
+            a for a in accepts
+            if a.startswith('application/vnd.api')
+        }
+
+    def check_request_headers(self, request, jsonapi_accepts):
+        """Check that request headers comply with spec.
+
+        Raises:
+            HTTPUnsupportedMediaType
+            HTTPNotAcceptable
+        """
+        # Spec says to reject (with 415) any request with media type
+        # params.
+        if len(request.headers.get('content-type', '').split(';')) > 1:
+            raise HTTPUnsupportedMediaType(
+                'Media Type parameters not allowed by JSONAPI ' +
+                'spec (http://jsonapi.org/format).'
+            )
+        # Spec says throw 406 Not Acceptable if Accept header has no
+        # application/vnd.api+json entry without parameters.
+        if jsonapi_accepts and\
+                'application/vnd.api+json' not in jsonapi_accepts:
+            raise HTTPNotAcceptable(
+                'application/vnd.api+json must appear with no ' +
+                'parameters in Accepts header ' +
+                '(http://jsonapi.org/format).'
+            )
+
+    def check_request_valid_json(self, request):
+        """Check that the body of any request is valid JSON.
+
+        Raises:
+            HTTPBadRequest
+        """
+        if request.content_length:
+            try:
+                request.json_body
+            except ValueError:
+                raise HTTPBadRequest("Body is not valid JSON.")
+
+    def sh_check_request(self, request):
+        """Perform common request validity checks."""
+        self.check_request_headers(request, self.get_jsonapi_accepts(request))
+        self.check_request_valid_json(request)
+
+        if request.content_length and self.api.settings.schema_validation:
+            # Validate request JSON against the JSONAPI jsonschema
+            self.api.metadata.JSONSchema.validate(request.json_body, request.method)
+
+        # Spec says throw BadRequest if any include paths reference non
+        # existent attributes or relationships.
+        if self.bad_include_paths:
+            raise HTTPBadRequest(
+                "Bad include paths {}".format(
+                    self.bad_include_paths
+                )
+            )
+
+        # Spec says set Content-Type to application/vnd.api+json.
+        request.response.content_type = 'application/vnd.api+json'
+
+        # Extract id and relationship from route, if provided
+        self.obj_id = self.request.matchdict.get('id', None)
+        self.relname = self.request.matchdict.get('relationship', None)
+
+        return request
+
+    def sh_document_self_link(self, doc):
+        """Include a self link unless the method is PATCH."""
+        if self.request.method != 'PATCH':
+            selfie = {'self': self.request.url}
+            if hasattr(doc, 'links'):
+                doc.links.update(selfie)
+            else:
+                doc.links = selfie
+        return doc
+
+    def sh_document_debug_info(self, doc):
+        """Potentially add some debug information."""
+        if self.api.settings.debug_meta:
+            debug = {
+                'accept_header': {
+                    a: None for a in self.get_jsonapi_accepts(self.request)
+                },
+                'qinfo_page':
+                    self.collection_query_info(self.request)['_page'],
+                'atts': {k: None for k in self.attributes.keys()},
+                'includes': {
+                    k: None for k in self.requested_include_names()
+                }
+            }
+            doc.meta.update({'debug': debug})
+        return doc
+
+    def single_result(self, query, obj_id=None, collection_name=None, not_found_message=None):
+        obj_id = obj_id or self.obj_id
+        collection_name = collection_name or self.collection_name
+        try:
+            item = query.one()
+        except (NoResultFound, DataError, StatementError):
+            if not_found_message:
+                raise HTTPNotFound(not_found_message)
+            else:
+                raise HTTPNotFound('Object {} not found in collection {}'.format(
+                    obj_id,
+                    collection_name
+                ))
+
+    def execute_stage(self, method, stage, arg):
+        for handler in self.stages['{}_{}'.format(method, stage)]:
+            arg = handler(self, arg)
+        return arg
+
+    def initial_related_queries(self, results):
+        rq = {}
+        return rq
+
+    def add_related_results(self, results, related_queries):
+        pass
+
+    def serialise_results(self, results):
+        doc = pyramid_jsonapi.jsonapi.Document()
+        return doc
+
+    def pj_view(func):
+        view_method = func.__name__
+        @functools.wraps(func)
+        def new_func(self):
+            # Build a set of expected responses.
+            ep_dict = self.api.endpoint_data.endpoints
+            # Get route_name from route
+            _, _, endpoint = self.request.matched_route.name.split(':')
+            http_method = self.request.method
+            responses = set(
+                ep_dict['responses'].keys() |
+                ep_dict['endpoints'][endpoint]['responses'].keys() |
+                ep_dict['endpoints'][endpoint]['http_methods'][http_method]['responses'].keys()
+            )
+
+            try:
+                request = self.execute_stage(view_method, 'request', self.request)
+                self.request = request
+                query = getattr(self, '{}_initial_query'.format(view_method))()
+                query = self.execute_stage(view_method, 'query', query)
+                results = getattr(self, '{}_execute_query'.format(view_method))(query)
+                results = self.execute_stage(view_method, 'results', results)
+                related_queries = self.initial_related_queries(results)
+                related_queries = self.execute_stage(view_method, 'related_queries', related_queries)
+                self.add_related_results(results, related_queries)
+                document = self.serialise_results(results)
+                document = self.execute_stage(view_method, 'document', document)
+            except Exception as exc:
+                if exc.__class__ not in responses:
+                    logging.exception(
+                        "Invalid exception raised: %s for route_name: %s path: %s",
+                        exc.__class__,
+                        self.request.matched_route.name,
+                        self.request.current_route_path()
+                    )
+                    if hasattr(exc, 'code'):
+                        if 400 <= exc.code < 500:  # pylint:disable=no-member
+                            raise HTTPBadRequest("Unexpected client error: {}".format(exc))
+                    else:
+                        raise HTTPInternalServerError("Unexpected server error.")
+                raise
+
+            # Log any responses that were not expected.
+            response_class = status_map[self.request.response.status_code]
+            if response_class not in responses:
+                logging.error(
+                    "Invalid response: %s for route_name: %s path: %s",
+                    response_class,
+                    self.request.matched_route.name,
+                    self.request.current_route_path()
+                )
+            return document.as_dict()
+        return new_func
+
+    @pj_view
     def get(self):
+        """Handle GET request for a single item.
+
+        Get a single item from the collection, referenced by id.
+
+        **URL (matchdict) Parameters**
+
+            **id** (*str*): resource id
+
+        Returns:
+            jsonapi.Document: in the form:
+
+            .. parsed-literal::
+
+                {
+                    "data": { resource object },
+                    "links": {
+                        "self": self url,
+                        maybe other links...
+                    },
+                    "meta": { jsonapi specific information }
+                }
+
+        Raises:
+            HTTPNotFound
+
+        Example:
+
+            Get person 1:
+
+            .. parsed-literal::
+
+                http GET http://localhost:6543/people/1
+        """
+        pass
+
+    def get_initial_query(self):
+        return self.single_item_query()
+
+    def get_execute_query(self, query):
+        return Results(is_collection=False, data=self.single_result(query))
+
+    @jsonapi_view
+    def get_old(self):
         """Handle GET request for a single item.
 
         Get a single item from the collection, referenced by id.

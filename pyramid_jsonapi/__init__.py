@@ -45,6 +45,13 @@ import pyramid_jsonapi.version
 
 __version__ = pyramid_jsonapi.version.get_version()
 
+method_stages = ('request', 'query', 'results', 'related_queries', 'document')
+method_names = (
+    'get', 'patch', 'delete',
+    'collection_get', 'collection_post',
+    'related_get',
+    'relationships_get', 'relationships_post', 'relationships_patch', 'relationships_delete'
+)
 
 class PyramidJSONAPI():
     """Class encapsulating an API.
@@ -301,6 +308,8 @@ class PyramidJSONAPI():
         fields.update(rels)
         class_attrs['fields'] = fields
 
+        class_attrs['stages'] = {}
+
         # All callbacks have the current view as the first argument. The comments
         # below detail subsequent args.
         class_attrs['callbacks'] = {
@@ -319,11 +328,31 @@ class PyramidJSONAPI():
                 deque(),                            # args: parent_item(sqlalchemy)
         }
 
-        return type(
+        view_class = type(
             'CollectionView<{}>'.format(collection_name),
             (pyramid_jsonapi.collection_view.CollectionViewBase, ),
             class_attrs
         )
+
+        for method in method_names:
+            for stage in method_stages:
+                stage_handler_name = '{}_{}'.format(method, stage)
+                sm_deque = deque()
+                view_class.stages[stage_handler_name] = sm_deque
+                if stage == 'request':
+                    sm_deque.append(view_class.sh_check_request)
+                if stage == 'document':
+                    sm_deque.extend((
+                        view_class.sh_document_self_link,
+                        view_class.sh_document_debug_info
+                    ))
+                try:
+                    sm_deque.append(getattr(view_class, 'sh_{}'.format(stage_handler_name)))
+                except AttributeError:
+                    pass
+
+        return view_class
+
 
     def append_callback_set_to_all_views(self, set_name):  # pylint:disable=invalid-name
         """Append a named set of callbacks to all view classes.
