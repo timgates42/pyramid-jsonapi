@@ -19,6 +19,7 @@ from pyramid.httpexceptions import (
     status_map,
 )
 import pyramid_jsonapi.jsonapi
+from pyramid_jsonapi import pjview
 from pyramid_jsonapi.results import Results
 import sqlalchemy
 from sqlalchemy.orm import load_only
@@ -385,78 +386,8 @@ class CollectionViewBase:
                     collection_name
                 ))
 
-    def execute_stage(self, method, stage, arg):
-        for handler in self.stages['{}_{}'.format(method, stage)]:
-            arg = handler(self, arg)
-        return arg
-
-    def initial_related_queries(self, results):
-        rq = {}
-        return rq
-
-    def add_related_results(self, results, related_queries):
-        pass
-
-    def serialise_results(self, results):
-        doc = pyramid_jsonapi.jsonapi.Document()
-        return doc
-
-    def pj_view(func):
-        view_method = func.__name__
-        @functools.wraps(func)
-        def new_func(self):
-            # Build a set of expected responses.
-            ep_dict = self.api.endpoint_data.endpoints
-            # Get route_name from route
-            _, _, endpoint = self.request.matched_route.name.split(':')
-            http_method = self.request.method
-            responses = set(
-                ep_dict['responses'].keys() |
-                ep_dict['endpoints'][endpoint]['responses'].keys() |
-                ep_dict['endpoints'][endpoint]['http_methods'][http_method]['responses'].keys()
-            )
-
-            try:
-                request = self.execute_stage(view_method, 'request', self.request)
-                self.request = request
-                query = getattr(self, '{}_initial_query'.format(view_method))()
-                query = self.execute_stage(view_method, 'query', query)
-                results = getattr(self, '{}_execute_query'.format(view_method))(query)
-                results = self.execute_stage(view_method, 'results', results)
-                related_queries = self.initial_related_queries(results)
-                related_queries = self.execute_stage(view_method, 'related_queries', related_queries)
-                self.add_related_results(results, related_queries)
-                document = self.serialise_results(results)
-                document = self.execute_stage(view_method, 'document', document)
-            except Exception as exc:
-                if exc.__class__ not in responses:
-                    logging.exception(
-                        "Invalid exception raised: %s for route_name: %s path: %s",
-                        exc.__class__,
-                        self.request.matched_route.name,
-                        self.request.current_route_path()
-                    )
-                    if hasattr(exc, 'code'):
-                        if 400 <= exc.code < 500:  # pylint:disable=no-member
-                            raise HTTPBadRequest("Unexpected client error: {}".format(exc))
-                    else:
-                        raise HTTPInternalServerError("Unexpected server error.")
-                raise
-
-            # Log any responses that were not expected.
-            response_class = status_map[self.request.response.status_code]
-            if response_class not in responses:
-                logging.error(
-                    "Invalid response: %s for route_name: %s path: %s",
-                    response_class,
-                    self.request.matched_route.name,
-                    self.request.current_route_path()
-                )
-            return document.as_dict()
-        return new_func
-
-    @pj_view
-    def get(self):
+    @pjview.view_attr
+    def get_splat(self):
         """Handle GET request for a single item.
 
         Get a single item from the collection, referenced by id.

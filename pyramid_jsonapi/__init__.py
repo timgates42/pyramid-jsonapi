@@ -41,6 +41,7 @@ import pyramid_jsonapi.endpoints
 import pyramid_jsonapi.filters
 import pyramid_jsonapi.jsonapi
 import pyramid_jsonapi.metadata
+import pyramid_jsonapi.pjview
 import pyramid_jsonapi.version
 
 __version__ = pyramid_jsonapi.version.get_version()
@@ -327,6 +328,8 @@ class PyramidJSONAPI():
             'before_relationships_delete':
                 deque(),                            # args: parent_item(sqlalchemy)
         }
+
+        class_attrs['get'] = pyramid_jsonapi.pjview.get()
 
         view_class = type(
             'CollectionView<{}>'.format(collection_name),
