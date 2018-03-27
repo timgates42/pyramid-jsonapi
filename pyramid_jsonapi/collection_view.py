@@ -19,6 +19,7 @@ from pyramid.httpexceptions import (
     status_map,
 )
 import pyramid_jsonapi.jsonapi
+from pyramid_jsonapi.pjview import get as pj_get
 from pyramid_jsonapi import pjview
 from pyramid_jsonapi.results import Results
 import sqlalchemy
@@ -282,96 +283,6 @@ class CollectionViewBase:
             if a.startswith('application/vnd.api')
         }
 
-    def check_request_headers(self, request, jsonapi_accepts):
-        """Check that request headers comply with spec.
-
-        Raises:
-            HTTPUnsupportedMediaType
-            HTTPNotAcceptable
-        """
-        # Spec says to reject (with 415) any request with media type
-        # params.
-        if len(request.headers.get('content-type', '').split(';')) > 1:
-            raise HTTPUnsupportedMediaType(
-                'Media Type parameters not allowed by JSONAPI ' +
-                'spec (http://jsonapi.org/format).'
-            )
-        # Spec says throw 406 Not Acceptable if Accept header has no
-        # application/vnd.api+json entry without parameters.
-        if jsonapi_accepts and\
-                'application/vnd.api+json' not in jsonapi_accepts:
-            raise HTTPNotAcceptable(
-                'application/vnd.api+json must appear with no ' +
-                'parameters in Accepts header ' +
-                '(http://jsonapi.org/format).'
-            )
-
-    def check_request_valid_json(self, request):
-        """Check that the body of any request is valid JSON.
-
-        Raises:
-            HTTPBadRequest
-        """
-        if request.content_length:
-            try:
-                request.json_body
-            except ValueError:
-                raise HTTPBadRequest("Body is not valid JSON.")
-
-    def sh_check_request(self, request):
-        """Perform common request validity checks."""
-        self.check_request_headers(request, self.get_jsonapi_accepts(request))
-        self.check_request_valid_json(request)
-
-        if request.content_length and self.api.settings.schema_validation:
-            # Validate request JSON against the JSONAPI jsonschema
-            self.api.metadata.JSONSchema.validate(request.json_body, request.method)
-
-        # Spec says throw BadRequest if any include paths reference non
-        # existent attributes or relationships.
-        if self.bad_include_paths:
-            raise HTTPBadRequest(
-                "Bad include paths {}".format(
-                    self.bad_include_paths
-                )
-            )
-
-        # Spec says set Content-Type to application/vnd.api+json.
-        request.response.content_type = 'application/vnd.api+json'
-
-        # Extract id and relationship from route, if provided
-        self.obj_id = self.request.matchdict.get('id', None)
-        self.relname = self.request.matchdict.get('relationship', None)
-
-        return request
-
-    def sh_document_self_link(self, doc):
-        """Include a self link unless the method is PATCH."""
-        if self.request.method != 'PATCH':
-            selfie = {'self': self.request.url}
-            if hasattr(doc, 'links'):
-                doc.links.update(selfie)
-            else:
-                doc.links = selfie
-        return doc
-
-    def sh_document_debug_info(self, doc):
-        """Potentially add some debug information."""
-        if self.api.settings.debug_meta:
-            debug = {
-                'accept_header': {
-                    a: None for a in self.get_jsonapi_accepts(self.request)
-                },
-                'qinfo_page':
-                    self.collection_query_info(self.request)['_page'],
-                'atts': {k: None for k in self.attributes.keys()},
-                'includes': {
-                    k: None for k in self.requested_include_names()
-                }
-            }
-            doc.meta.update({'debug': debug})
-        return doc
-
     def single_result(self, query, obj_id=None, collection_name=None, not_found_message=None):
         obj_id = obj_id or self.obj_id
         collection_name = collection_name or self.collection_name
@@ -387,7 +298,7 @@ class CollectionViewBase:
                 ))
 
     @pjview.view_attr
-    def get_splat(self):
+    def get(self):
         """Handle GET request for a single item.
 
         Get a single item from the collection, referenced by id.
@@ -422,12 +333,6 @@ class CollectionViewBase:
                 http GET http://localhost:6543/people/1
         """
         pass
-
-    def get_initial_query(self):
-        return self.single_item_query()
-
-    def get_execute_query(self, query):
-        return Results(is_collection=False, data=self.single_result(query))
 
     @jsonapi_view
     def get_old(self):
