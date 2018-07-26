@@ -1705,11 +1705,11 @@ class CollectionViewBase:
             item = False
         return bool(item)
 
-    def column_info_from_name(self, name, model=None):
-        """Get the pyramid_jsonapi info dictionary for a column.
+    def mapped_info_from_name(self, name, model=None):
+        """Get the pyramid_jsonapi info dictionary for a mapped object.
 
         Parameters:
-            name (str): name of column.
+            name (str): name of object.
 
             model (sqlalchemy.ext.declarative.declarative_base): model to
                 inspect. Defaults to self.model.
@@ -1769,7 +1769,7 @@ class CollectionViewBase:
         resource_json.attributes = {
             key: getattr(item, key)
             for key in self.requested_attributes.keys()
-            if self.column_info_from_name(key).get('visible', True)
+            if self.mapped_info_from_name(key).get('visible', True)
         }
         resource_json.links = {'self': item_url}
 
@@ -1779,6 +1779,8 @@ class CollectionViewBase:
             if '.'.join(include_path + [key]) in self.requested_include_names():
                 is_included = True
             if key not in self.requested_relationships and not is_included:
+                continue
+            if not self.mapped_info_from_name(key).get('visible', True):
                 continue
             rel_dict = {
                 'data': None,
@@ -1936,7 +1938,12 @@ class CollectionViewBase:
             #
             # Find all the filters.
             if match.group(1) == 'filter':
-                colspec, operator = match.group(2).split(':')
+                colspec = match.group(2)
+                operator = 'eq'
+                try:
+                    colspec, operator = colspec.split(':')
+                except ValueError:
+                    pass
                 colspec = colspec.split('.')
                 info['_filters'][param] = {
                     'colspec': colspec,
